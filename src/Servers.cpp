@@ -2096,10 +2096,17 @@ void Server::rpc_blockchain_transaction_broadcast(Client *c, const RPC::BatchId 
                 const auto decision = SlipstreamClient::shouldUseSlipstream(
                     decisionUrl, apiToken, rawtxhex, res->txid, res->feeRate, timeoutSecs);
                 if (!decision.ok) {
+                    Log() << "Slipstream decision API failed for txid " << res->txid
+                          << " feeRate=" << res->feeRate << " sats/vByte: " << decision.message;
                     res->failed = true;
                     res->errorMessage = decision.message;
                     return;
                 }
+                Log() << "Slipstream decision API ok for txid " << res->txid
+                      << " feeRate=" << res->feeRate << " sats/vByte"
+                      << " should_use_slipstream=" << (decision.shouldUse ? "true" : "false")
+                      << (decision.shouldUse ? "; Slipstream handled by decision API"
+                                             : "; using bitcoind");
                 // true → decision API already broadcast via Slipstream; false → use bitcoind locally
                 if (!decision.shouldUse)
                     res->useBitcoind = true;
@@ -2107,8 +2114,6 @@ void Server::rpc_blockchain_transaction_broadcast(Client *c, const RPC::BatchId 
             // Completion — client thread
             [this, c, batchId, reqId = m.id, rawtxhex, txkey, broadcastViaBitcoind, res] {
                 if (res->useBitcoind) {
-                    DebugM("Slipstream: should_use_slipstream=false for txid ", res->txid,
-                           " feeRate=", res->feeRate, "; using bitcoind");
                     broadcastViaBitcoind(rawtxhex, txkey);
                     return;
                 }
