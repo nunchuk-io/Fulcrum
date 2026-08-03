@@ -27,10 +27,12 @@
 #include "PeerMgr.h"
 #include "Rpa.h"
 #include "ServerMisc.h"
+#include "SlipstreamClient.h"
 #include "SrvMgr.h"
 #include "Storage.h"
 #include "SubsMgr.h"
 #include "ThreadPool.h"
+#include "TXO.h"
 #include "Util.h"
 #include "WebSocket.h"
 
@@ -2036,7 +2038,98 @@ namespace {
         // set maxburnrate to max BTC supply to preserve pre-25.0 functionality
         params.push_back(21'000'000);
     }
+
+    struct TxFeeInfo {
+        double feeRateSatsPerVByte = 0.;
+        QString txid; ///< big-endian hex (JSON / Electrum order)
+    };
+
+    /// Fee rate + txid for a raw tx hex, using confirmed+mempool UTXOs from Storage.
+    /// On failure, sets *errOut (if non-null) and returns nullopt.
+    std::optional<TxFeeInfo> computeTxFeeInfo(Storage &storage, const QByteArray &rawtxhex, QString *errOut)
+    {
+        const auto fail = [&](const QString &msg) -> std::optional<TxFeeInfo> {
+            if (errOut) *errOut = msg;
+            return std::nullopt;
+        };
+
+        const QByteArray bytes = Util::ParseHexFast(rawtxhex);
+        if (bytes.isEmpty() || rawtxhex.size() % 2)
+            return fail(QStringLiteral("cannot determine transaction fee rate (invalid tx hex)"));
+
+        bitcoin::CMutableTransaction mtx;
+        try {
+            BTC::Deserialize(mtx, bytes, 0, /*allowSegWit=*/true);
+        } catch (const std::exception &e) {
+            return fail(QStringLiteral("cannot determine transaction fee rate (invalid tx: %1)")
+                            .arg(QString::fromUtf8(e.what())));
+        }
+        const bitcoin::CTransaction tx(std::move(mtx));
+
+        if (tx.IsCoinBase())
+            return fail(QStringLiteral("cannot determine transaction fee rate (coinbase)"));
+
+        const size_t sizeBytes = tx.GetTotalSize(/*segwit=*/true, /*mweb=*/false);
+        const size_t vsize = tx.HasWitness() ? tx.GetVirtualSize(sizeBytes) : sizeBytes;
+        if (vsize == 0)
+            return fail(QStringLiteral("cannot determine transaction fee rate (zero vsize)"));
+
+        bitcoin::Amount inputSum = bitcoin::Amount::zero();
+        for (const auto &in : tx.vin) {
+            if (in.prevout.IsNull())
+                return fail(QStringLiteral("cannot determine transaction fee rate (null prevout)"));
+            const TXO txo{BTC::Hash2ByteArrayRev(in.prevout.GetTxId()), IONum(in.prevout.GetN())};
+            std::optional<TXOInfo> info;
+            try {
+                info = storage.utxoGet(txo);
+            } catch (const std::exception &e) {
+                return fail(QStringLiteral("cannot determine transaction fee rate (utxo lookup error: %1)")
+                                .arg(QString::fromUtf8(e.what())));
+            }
+            if (!info.has_value())
+                return fail(QStringLiteral("cannot determine transaction fee rate (missing input UTXO)"));
+            inputSum += info->amount;
+        }
+
+        const bitcoin::Amount fee = inputSum - tx.GetValueOut();
+        const int64_t feeSats = fee / bitcoin::Amount::satoshi();
+        if (feeSats < 0)
+            return fail(QStringLiteral("cannot determine transaction fee rate (negative fee)"));
+
+        TxFeeInfo out;
+        out.feeRateSatsPerVByte = double(feeSats) / double(vsize);
+        out.txid = QString::fromLatin1(Util::ToHexFast(BTC::Hash2ByteArrayRev(tx.GetHash())));
+        return out;
+    }
+
+    /// Optional phishing-upgrade HTML warning for very old Electrum clients (shared by bitcoind & Slipstream paths).
+    QVariant maybePhishingWarningResult(Client *c, BTC::Coin coin, QVariant ret)
+    {
+        constexpr Version FirstNonVulnerableVersion(3, 3, 4);
+        if (const auto uaVersion = c->info.uaVersion(); uaVersion.isValid() && uaVersion < FirstNonVulnerableVersion) {
+            QString clientName, website;
+            if (coin == BTC::Coin::BTC) {
+                clientName = "Electrum";
+                website = "https://electrum.org/";
+            } else if (coin == BTC::Coin::LTC) {
+                clientName = "Electrum-LTC";
+                website = "https://electrum-ltc.org/";
+            } else {
+                clientName = "Electron Cash";
+                website = "https://electroncash.org/";
+            }
+            ret = QString("<br/><br/>"
+                          "Your transaction was successfully broadcast.<br/><br/>"
+                          "However, you are using a VULNERABLE version of %1.<br/>"
+                          "Download the latest version from this web site ONLY:<br/>"
+                          "%2"
+                          "<br/><br/>")
+                      .arg(clientName, website);
+        }
+        return ret;
+    }
 } // namespace
+
 void Server::rpc_blockchain_transaction_broadcast(Client *c, const RPC::BatchId batchId, const RPC::Message &m)
 {
     const QVariantList l = m.paramsList();
@@ -2046,85 +2139,157 @@ void Server::rpc_blockchain_transaction_broadcast(Client *c, const RPC::BatchId 
     // -- just the first 16 bytes of this hash are taken. Keeping the key compact is essential because the bloom
     // -- filter may end up applying murmur3 hash to the entire key we give it from 20-50 times!
     const QByteArray txkey = (!rawtxhex.isEmpty() ? BTC::HashOnce(Util::ParseHexFast(rawtxhex)).left(16) : QByteArrayLiteral("xx"));
-    // no need to validate hex here -- bitcoind does validation for us!
-    QVariantList params { rawtxhex } ;
-    if (bitcoindmgr->getRpcSupportInfo().sendRawTransactionRequiresMaxBurnAmount)
-        // bitcoin core 25.0+ requires specifying maxburnamount in sendrawtransaction call
-        appendMaxBurnAmountForBTCToParams(params);
-    generic_async_to_bitcoind(c, batchId, m.id, "sendrawtransaction", params,
-        // print to log, echo bitcoind's reply to client
-        [size=size_t(rawtxhex.length()/2), c, this, txkey](const RPC::Message & reply){
-            QVariant ret = reply.result();
-            ++c->info.nTxSent;
-            c->info.nTxBytesSent += size;
-            emit broadcastTxSuccess(1u, size);
-            QByteArray logLine;
-            {
-                QTextStream ts{&logLine, QIODevice::WriteOnly};
-                ts << "Broadcast tx for client " << c->id;
-                if (!options->anonLogs) ts << ", size: " << qulonglong(size) << " bytes, response: " << ret.toString();
-            }
-            logFilter->broadcast(true, logLine, txkey);
-            // Next, check if client is old and has the phishing exploit:
-            // version 3.3.4 was the first one that was good for both Electron Cash and Electrum
-            constexpr Version FirstNonVulnerableVersion(3,3,4);
-            if (const auto uaVersion = c->info.uaVersion(); uaVersion.isValid() && uaVersion < FirstNonVulnerableVersion) {
-                // The below is to warn old clients that they are vulnerable to a phishing attack.
-                // This logic is also used by the ElectronX implementations here:
-                // https://github.com/Electron-Cash/electrumx/blob/fbd00416d804c286eb7de856e9399efb07a2ceaf/electrumx/server/session.py#L1526
-                // https://github.com/Electron-Cash/electrumx/blob/fbd00416d804c286eb7de856e9399efb07a2ceaf/electrumx/lib/coins.py#L397
-                QString clientName, website;
-                if (coin == BTC::Coin::BTC) {
-                    clientName = "Electrum";
-                    website = "https://electrum.org/";
-                } else if (coin == BTC::Coin::LTC) {
-                    clientName = "Electrum-LTC";
-                    website = "https://electrum-ltc.org/";
-                } else {
-                    clientName = "Electron Cash";
-                    website = "https://electroncash.org/";
-                }
-                ret = QString("<br/><br/>"
-                              "Your transaction was successfully broadcast.<br/><br/>"
-                              "However, you are using a VULNERABLE version of %1.<br/>"
-                              "Download the latest version from this web site ONLY:<br/>"
-                              "%2"
-                              "<br/><br/>").arg(clientName, website);
-                logLine.clear();
-                QTextStream{&logLine, QIODevice::WriteOnly}
-                    << "Client " << c->id << " has a vulnerable " << clientName << " (" << uaVersion.toString()
-                    << "); upgrade warning HTML sent to client";
-                logFilter->broadcast(true, logLine, logLine);
-            }
-            return ret;
-        },
-        // error func, throw an RPCError that's formatted in a particular way
-        [c, this, txkey] (const RPC::Message & errResponse) {
-            ++c->info.nTxBroadcastErrors;
-            const auto errorMessage = errResponse.errorMessage();
-            {
-                // This "logFilter" mechanism was added in Fulcrum 1.2.5 to suppress repeated Mist Miner broadcast fail
-                // spam from appearing in the log.  We basically observed that the Mist Miners keep spamming the same
-                // tx's over and over again.  So we simply take the bytes of the tx, hash that and use a rolling bloom
-                // filter to keep track of tx's we've seen (bloom filter size: 16384).  In this way, we don't produce
-                // duplicate log messages in the default Log() for the same tx broadcast failure. (But we do still
-                // produce Debug() log messages, if debug logging is enabled).
+
+    // Common bitcoind sendrawtransaction path (also used when decision API says not to use Slipstream).
+    const auto broadcastViaBitcoind = [this, c, batchId, reqId = m.id](const QByteArray &rawtxhex, const QByteArray &txkey) {
+        QVariantList params{rawtxhex};
+        if (bitcoindmgr->getRpcSupportInfo().sendRawTransactionRequiresMaxBurnAmount)
+            appendMaxBurnAmountForBTCToParams(params);
+        generic_async_to_bitcoind(c, batchId, reqId, "sendrawtransaction", params,
+            // print to log, echo bitcoind's reply to client
+            [size = size_t(rawtxhex.length() / 2), c, this, txkey](const RPC::Message &reply) {
+                QVariant ret = reply.result();
+                ++c->info.nTxSent;
+                c->info.nTxBytesSent += size;
+                emit broadcastTxSuccess(1u, size);
                 QByteArray logLine;
-                QTextStream{&logLine, QIODevice::WriteOnly}
-                    << "Broadcast fail for client " << c->id << ": " << errorMessage.left(120);
-                logFilter->broadcast(false, logLine, txkey);
-            }
-            throw RPCError(QString("the transaction was rejected by network rules.\n\n"
-                                   // Note: ElectrumX here would also spit back the [txhex] after the final newline.
-                                   // We do not do that, since it's a waste of bandwidth and also Electron Cash
-                                   // ignores that information anyway.
-                                   "%1\n").arg(errorMessage),
-                            RPC::Code_App_BadRequest /**< ex does this here.. inconsistent with transaction.get,
-                                                      * so for now we emulate that until we verify that EC
-                                                      * will be ok with us changing it to Code_App_DaemonError */
-                           );
-        }
-    );
+                {
+                    QTextStream ts{&logLine, QIODevice::WriteOnly};
+                    ts << "Broadcast tx for client " << c->id;
+                    if (!options->anonLogs)
+                        ts << ", size: " << qulonglong(size) << " bytes, response: " << ret.toString();
+                }
+                logFilter->broadcast(true, logLine, txkey);
+                const QVariant warned = maybePhishingWarningResult(c, coin, ret);
+                if (warned != ret) {
+                    QByteArray warnLine;
+                    QTextStream{&warnLine, QIODevice::WriteOnly}
+                        << "Client " << c->id << " has a vulnerable client (" << c->info.uaVersion().toString()
+                        << "); upgrade warning HTML sent to client";
+                    logFilter->broadcast(true, warnLine, warnLine);
+                    return warned;
+                }
+                return ret;
+            },
+            // error func, throw an RPCError that's formatted in a particular way
+            [c, this, txkey](const RPC::Message &errResponse) {
+                ++c->info.nTxBroadcastErrors;
+                const auto errorMessage = errResponse.errorMessage();
+                {
+                    QByteArray logLine;
+                    QTextStream{&logLine, QIODevice::WriteOnly}
+                        << "Broadcast fail for client " << c->id << ": " << errorMessage.left(120);
+                    logFilter->broadcast(false, logLine, txkey);
+                }
+                throw RPCError(QString("the transaction was rejected by network rules.\n\n"
+                                       "%1\n")
+                                   .arg(errorMessage),
+                               RPC::Code_App_BadRequest);
+            });
+    };
+
+    if (options->slipstream && isBTC()) {
+        struct SlipstreamWorkResult {
+            bool useBitcoind = false;
+            bool failed = false;
+            QString slipstreamTxid;
+            QString errorMessage; ///< set when failed; may be decision/slipstream/fee-rate error text
+            double feeRate = 0.;
+            QString txid;
+        };
+        generic_do_async(
+            c, batchId, m.id,
+            // Work — threadpool
+            [storage = this->storage, rawtxhex,
+             decisionUrl = options->slipstreamDecisionUrl,
+             apiToken = options->slipstreamApiToken,
+             url = options->slipstreamUrl,
+             clientCode = options->slipstreamClientCode,
+             timeoutSecs = options->slipstreamTimeoutSecs] {
+                SlipstreamWorkResult out;
+                {
+                    QString feeErr;
+                    const auto feeOpt = computeTxFeeInfo(*storage, rawtxhex, &feeErr);
+                    if (!feeOpt) {
+                        out.failed = true;
+                        out.errorMessage = feeErr;
+                        return out;
+                    }
+                    out.feeRate = feeOpt->feeRateSatsPerVByte;
+                    out.txid = feeOpt->txid;
+                }
+                const auto decision = SlipstreamClient::shouldUseSlipstream(
+                    decisionUrl, apiToken, rawtxhex, out.txid, out.feeRate, timeoutSecs);
+                if (!decision.ok) {
+                    out.failed = true;
+                    out.errorMessage = decision.message;
+                    return out;
+                }
+                if (!decision.shouldUse) {
+                    out.useBitcoind = true;
+                    return out;
+                }
+                const auto res = SlipstreamClient::submitTx(url, clientCode, rawtxhex, timeoutSecs);
+                if (!res.ok) {
+                    out.failed = true;
+                    out.errorMessage = QString("the transaction was rejected by network rules.\n\n"
+                                               "slipstream: %1\n")
+                                           .arg(res.message);
+                    return out;
+                }
+                out.slipstreamTxid = res.message;
+                return out;
+            },
+            // Completion — client thread
+            [this, c, batchId, reqId = m.id, rawtxhex, txkey, broadcastViaBitcoind](const SlipstreamWorkResult &res) {
+                if (res.useBitcoind) {
+                    DebugM("Slipstream: should_use_slipstream=false for txid ", res.txid,
+                           " feeRate=", res.feeRate, "; using bitcoind");
+                    broadcastViaBitcoind(rawtxhex, txkey);
+                    return;
+                }
+                if (res.failed) {
+                    ++c->info.nTxBroadcastErrors;
+                    {
+                        QByteArray logLine;
+                        QTextStream{&logLine, QIODevice::WriteOnly}
+                            << "Broadcast fail (Slipstream path) for client " << c->id << ": "
+                            << res.errorMessage.left(120);
+                        logFilter->broadcast(false, logLine, txkey);
+                    }
+                    emit c->sendError(false, RPC::Code_App_BadRequest, res.errorMessage, batchId, reqId);
+                    return;
+                }
+                const size_t size = size_t(rawtxhex.length() / 2);
+                ++c->info.nTxSent;
+                c->info.nTxBytesSent += size;
+                emit broadcastTxSuccess(1u, size);
+                QVariant ret = res.slipstreamTxid;
+                QByteArray logLine;
+                {
+                    QTextStream ts{&logLine, QIODevice::WriteOnly};
+                    ts << "Broadcast tx via Slipstream for client " << c->id;
+                    if (!options->anonLogs)
+                        ts << ", size: " << qulonglong(size) << " bytes, feeRate: " << res.feeRate
+                           << " sats/vByte, response: " << res.slipstreamTxid;
+                }
+                logFilter->broadcast(true, logLine, txkey);
+                const QVariant warned = maybePhishingWarningResult(c, coin, ret);
+                if (warned != ret) {
+                    QByteArray warnLine;
+                    QTextStream{&warnLine, QIODevice::WriteOnly}
+                        << "Client " << c->id << " has a vulnerable client (" << c->info.uaVersion().toString()
+                        << "); upgrade warning HTML sent to client";
+                    logFilter->broadcast(true, warnLine, warnLine);
+                    ret = warned;
+                }
+                emit c->sendResult(batchId, reqId, ret);
+            });
+        return;
+    }
+
+    // Default path (Slipstream off or non-BTC)
+    broadcastViaBitcoind(rawtxhex, txkey);
     // <-- do nothing right now, return without replying. Will respond when daemon calls us back in callbacks above.
 }
 void Server::rpc_blockchain_transaction_broadcast_package(Client *c, const RPC::BatchId batchId, const RPC::Message &m)

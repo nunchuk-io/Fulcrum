@@ -374,6 +374,7 @@ SOURCES += \
     RPCMsgId.cpp \
     ServerMisc.cpp \
     Servers.cpp \
+    SlipstreamClient.cpp \
     SrvMgr.cpp \
     Storage.cpp \
     Storage/Compat.cpp \
@@ -426,6 +427,7 @@ HEADERS += \
     RPCMsgId.h \
     ServerMisc.h \
     Servers.h \
+    SlipstreamClient.h \
     Span.h \
     SrvMgr.h \
     Storage.h \

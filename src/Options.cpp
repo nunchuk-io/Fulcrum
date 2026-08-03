@@ -205,6 +205,14 @@ QVariantMap Options::toMap() const
     // upnp
     m["upnp"] = upnp;
 
+    // slipstream
+    m["slipstream"] = slipstream;
+    m["slipstream_url"] = slipstreamUrl;
+    m["slipstream_client_code"] = slipstreamClientCode.isEmpty() ? QVariant() : QVariant("<hidden>");
+    m["slipstream_api_token"] = slipstreamApiToken.isEmpty() ? QVariant() : QVariant("<hidden>");
+    m["slipstream_decision_url"] = slipstreamDecisionUrl;
+    m["slipstream_timeout"] = slipstreamTimeoutSecs;
+
     return m;
 }
 
