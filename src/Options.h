@@ -313,6 +313,27 @@ public:
                              defaultStartHeightOtherNets = 0;
         int requestedStartHeight = -1;
     } rpa;
+
+    // Slipstream (MARA) private broadcast relay — runtime-gated to BTC only
+    // CLI: --slipstream / conf: slipstream
+    static constexpr bool defaultSlipstream = false;
+    bool slipstream = defaultSlipstream;
+    // CLI: --slipstream-url / conf: slipstream_url
+    QString slipstreamUrl = QStringLiteral("https://slipstream.mara.com");
+    // CLI: --slipstream-client-code / conf: slipstream_client_code — required when slipstream is enabled
+    QString slipstreamClientCode;
+    // CLI: --slipstream-api-token / conf: slipstream_api_token / env: SLIPSTREAM_API_TOKEN — required when enabled
+    QString slipstreamApiToken;
+    // CLI: --slipstream-decision-url / conf: slipstream_decision_url — Nunchuk decision endpoint
+    QString slipstreamDecisionUrl = QStringLiteral("https://api.nunchuk.io/v1.1/user-wallets/slipstream");
+    // CLI: --slipstream-timeout / conf: slipstream_timeout — seconds
+    static constexpr int defaultSlipstreamTimeoutSecs = 30,
+                         slipstreamTimeoutSecsMin = 1,
+                         slipstreamTimeoutSecsMax = 600;
+    static constexpr bool isSlipstreamTimeoutInRange(int s) {
+        return s >= slipstreamTimeoutSecsMin && s <= slipstreamTimeoutSecsMax;
+    }
+    int slipstreamTimeoutSecs = defaultSlipstreamTimeoutSecs;
 };
 
 /// A class encapsulating a simple read-only config file format.  The format is similar to the bitcoin.conf format

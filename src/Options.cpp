@@ -199,6 +199,14 @@ QVariantMap Options::toMap() const
     m["rpa_prefix_bits_min"] = rpa.prefixBitsMin;
     m["rpa_start_height"] = rpa.requestedStartHeight;
 
+    // slipstream
+    m["slipstream"] = slipstream;
+    m["slipstream_url"] = slipstreamUrl;
+    m["slipstream_client_code"] = slipstreamClientCode.isEmpty() ? QVariant() : QVariant("<hidden>");
+    m["slipstream_api_token"] = slipstreamApiToken.isEmpty() ? QVariant() : QVariant("<hidden>");
+    m["slipstream_decision_url"] = slipstreamDecisionUrl;
+    m["slipstream_timeout"] = slipstreamTimeoutSecs;
+
     return m;
 }
 
