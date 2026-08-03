@@ -2065,6 +2065,8 @@ void Server::rpc_blockchain_transaction_broadcast(Client *c, const RPC::BatchId 
     };
 
     if (options->slipstream && isBTC()) {
+        // Fulcrum 1.11.x generic_do_async only accepts work returning QVariant and always auto-replies.
+        // Slipstream needs a custom completion (bitcoind handoff / phishing warning), so use ThreadPool directly.
         struct SlipstreamWorkResult {
             bool useBitcoind = false;
             bool failed = false;
@@ -2073,81 +2075,80 @@ void Server::rpc_blockchain_transaction_broadcast(Client *c, const RPC::BatchId 
             double feeRate = 0.;
             QString txid;
         };
-        generic_do_async(
-            c, batchId, m.id,
+        auto res = std::make_shared<SlipstreamWorkResult>();
+        (asyncThreadPool ? asyncThreadPool : ::AppThreadPool())->submitWork(
+            c,
             // Work — threadpool
-            [storage = this->storage, rawtxhex,
+            [res, storage = this->storage, rawtxhex,
              decisionUrl = options->slipstreamDecisionUrl,
              apiToken = options->slipstreamApiToken,
              url = options->slipstreamUrl,
              clientCode = options->slipstreamClientCode,
              timeoutSecs = options->slipstreamTimeoutSecs] {
-                SlipstreamWorkResult out;
                 {
                     QString feeErr;
                     const auto feeOpt = computeTxFeeInfo(*storage, rawtxhex, &feeErr);
                     if (!feeOpt) {
-                        out.failed = true;
-                        out.errorMessage = feeErr;
-                        return out;
+                        res->failed = true;
+                        res->errorMessage = feeErr;
+                        return;
                     }
-                    out.feeRate = feeOpt->feeRateSatsPerVByte;
-                    out.txid = feeOpt->txid;
+                    res->feeRate = feeOpt->feeRateSatsPerVByte;
+                    res->txid = feeOpt->txid;
                 }
                 const auto decision = SlipstreamClient::shouldUseSlipstream(
-                    decisionUrl, apiToken, rawtxhex, out.txid, out.feeRate, timeoutSecs);
+                    decisionUrl, apiToken, rawtxhex, res->txid, res->feeRate, timeoutSecs);
                 if (!decision.ok) {
-                    out.failed = true;
-                    out.errorMessage = decision.message;
-                    return out;
+                    res->failed = true;
+                    res->errorMessage = decision.message;
+                    return;
                 }
                 if (!decision.shouldUse) {
-                    out.useBitcoind = true;
-                    return out;
+                    res->useBitcoind = true;
+                    return;
                 }
-                const auto res = SlipstreamClient::submitTx(url, clientCode, rawtxhex, timeoutSecs);
-                if (!res.ok) {
-                    out.failed = true;
-                    out.errorMessage = QString("the transaction was rejected by network rules.\n\n"
-                                               "slipstream: %1\n")
-                                           .arg(res.message);
-                    return out;
+                const auto submit = SlipstreamClient::submitTx(url, clientCode, rawtxhex, timeoutSecs);
+                if (!submit.ok) {
+                    res->failed = true;
+                    res->errorMessage = QString("the transaction was rejected by network rules.\n\n"
+                                                "slipstream: %1\n")
+                                            .arg(submit.message);
+                    return;
                 }
-                out.slipstreamTxid = res.message;
-                return out;
+                res->slipstreamTxid = submit.message;
             },
             // Completion — client thread
-            [this, c, batchId, reqId = m.id, rawtxhex, txkey, broadcastViaBitcoind](const SlipstreamWorkResult &res) {
-                if (res.useBitcoind) {
-                    DebugM("Slipstream: should_use_slipstream=false for txid ", res.txid,
-                           " feeRate=", res.feeRate, "; using bitcoind");
+            [this, c, batchId, reqId = m.id, rawtxhex, txkey, broadcastViaBitcoind, res] {
+                if (res->useBitcoind) {
+                    DebugM("Slipstream: should_use_slipstream=false for txid ", res->txid,
+                           " feeRate=", res->feeRate, "; using bitcoind");
                     broadcastViaBitcoind(rawtxhex, txkey);
                     return;
                 }
-                if (res.failed) {
+                if (res->failed) {
                     ++c->info.nTxBroadcastErrors;
                     {
                         QByteArray logLine;
                         QTextStream{&logLine, QIODevice::WriteOnly}
                             << "Broadcast fail (Slipstream path) for client " << c->id << ": "
-                            << res.errorMessage.left(120);
+                            << res->errorMessage.left(120);
                         logFilter->broadcast(false, logLine, txkey);
                     }
-                    emit c->sendError(false, RPC::Code_App_BadRequest, res.errorMessage, batchId, reqId);
+                    emit c->sendError(false, RPC::Code_App_BadRequest, res->errorMessage, batchId, reqId);
                     return;
                 }
                 const auto size = rawtxhex.length() / 2;
                 ++c->info.nTxSent;
                 c->info.nTxBytesSent += unsigned(size);
                 emit broadcastTxSuccess(unsigned(size));
-                QVariant ret = res.slipstreamTxid;
+                QVariant ret = res->slipstreamTxid;
                 QByteArray logLine;
                 {
                     QTextStream ts{&logLine, QIODevice::WriteOnly};
                     ts << "Broadcast tx via Slipstream for client " << c->id;
                     if (!options->anonLogs)
-                        ts << ", size: " << size << " bytes, feeRate: " << res.feeRate
-                           << " sats/vByte, response: " << res.slipstreamTxid;
+                        ts << ", size: " << size << " bytes, feeRate: " << res->feeRate
+                           << " sats/vByte, response: " << res->slipstreamTxid;
                 }
                 logFilter->broadcast(true, logLine, txkey);
                 const QVariant warned = maybePhishingWarningResult(c, coin, ret);
@@ -2160,7 +2161,8 @@ void Server::rpc_blockchain_transaction_broadcast(Client *c, const RPC::BatchId 
                     ret = warned;
                 }
                 emit c->sendResult(batchId, reqId, ret);
-            });
+            },
+            defaultTPFailFunc(c, batchId, m.id));
         return;
     }
 
