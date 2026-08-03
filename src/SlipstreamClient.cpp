@@ -102,60 +102,6 @@ HttpJsonResult httpPostJson(const QUrl &url, const QByteArray &payload, int time
 
 } // namespace
 
-SubmitResult submitTx(const QString &baseUrl, const QString &clientCode,
-                      const QByteArray &txHex, int timeoutSecs)
-{
-    SubmitResult ret;
-
-    QString urlStr = baseUrl.trimmed();
-    while (urlStr.endsWith('/'))
-        urlStr.chop(1);
-    if (urlStr.isEmpty()) {
-        ret.message = QStringLiteral("slipstream base URL is empty");
-        return ret;
-    }
-    const QUrl url(urlStr + QStringLiteral("/api/transactions"));
-
-    QVariantMap body;
-    body.insert(QStringLiteral("tx_hex"), QString::fromLatin1(txHex));
-    body.insert(QStringLiteral("client_code"), clientCode);
-    const auto http = httpPostJson(url, Json::toUtf8(body, true), timeoutSecs);
-    if (!http.ok) {
-        ret.message = http.error;
-        return ret;
-    }
-
-    QString status, message;
-    try {
-        const QVariant parsed = Json::parseUtf8(http.body, Json::ParseOption::AcceptAnyValue);
-        if (parsed.canConvert<QVariantMap>()) {
-            const QVariantMap m = parsed.toMap();
-            status = m.value(QStringLiteral("status")).toString();
-            message = m.value(QStringLiteral("message")).toString();
-            if (message.isEmpty())
-                message = m.value(QStringLiteral("error")).toString();
-        }
-    } catch (const std::exception &e) {
-        DebugM("Slipstream: failed to parse JSON response: ", e.what(),
-               " body=", QString::fromUtf8(http.body.left(200)));
-    }
-
-    if (status.compare(QStringLiteral("success"), Qt::CaseInsensitive) == 0) {
-        ret.ok = true;
-        ret.message = message;
-        if (ret.message.isEmpty())
-            ret.message = QStringLiteral("success");
-        return ret;
-    }
-
-    ret.message = !message.isEmpty()
-                      ? message
-                      : (http.body.isEmpty()
-                             ? QStringLiteral("unexpected response (HTTP %1)").arg(http.httpStatus)
-                             : QString::fromUtf8(http.body.left(200)));
-    return ret;
-}
-
 DecisionResult shouldUseSlipstream(const QString &decisionUrl, const QString &apiToken,
                                    const QByteArray &txHex, const QString &txId,
                                    double feeRateSatsPerVByte, int timeoutSecs)

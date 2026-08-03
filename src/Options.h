@@ -314,14 +314,10 @@ public:
         int requestedStartHeight = -1;
     } rpa;
 
-    // Slipstream (MARA) private broadcast relay — runtime-gated to BTC only
+    // Slipstream routing via Nunchuk decision API — runtime-gated to BTC only
     // CLI: --slipstream / conf: slipstream
     static constexpr bool defaultSlipstream = false;
     bool slipstream = defaultSlipstream;
-    // CLI: --slipstream-url / conf: slipstream_url
-    QString slipstreamUrl = QStringLiteral("https://slipstream.mara.com");
-    // CLI: --slipstream-client-code / conf: slipstream_client_code — required when slipstream is enabled
-    QString slipstreamClientCode;
     // CLI: --slipstream-api-token / conf: slipstream_api_token / env: SLIPSTREAM_API_TOKEN — required when enabled
     QString slipstreamApiToken;
     // CLI: --slipstream-decision-url / conf: slipstream_decision_url — Nunchuk decision endpoint
