@@ -30,7 +30,10 @@ namespace SlipstreamClient {
 ///   Authorization: Bearer <apiToken>
 ///   Content-Type: application/json
 ///   Body: { "tx_hex": "<hex>", "tx_id": "<hex>", "fee_rate": <positive decimal sat/vB> }
-///   Response 200 JSON: { "data": { "should_use_slipstream": <bool> } }
+///   Response 200 JSON:
+///     { "data": { "status": "<string>", "message": "<string>",
+///                 "should_use_slipstream": <bool> } }
+///   If data.status == "error", Fulcrum fails the broadcast with data.message as the client error text.
 /// When should_use_slipstream is true, the decision API itself performs the Slipstream
 /// broadcast; Fulcrum only needs to echo the txid to the Electrum client.
 struct DecisionResult {

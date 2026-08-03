@@ -145,7 +145,16 @@ DecisionResult shouldUseSlipstream(const QString &decisionUrl, const QString &ap
             ret.message = QStringLiteral("should_use_slipstream: response missing data object");
             return ret;
         }
-        const QVariant v = dataVar.toMap().value(QStringLiteral("should_use_slipstream"));
+        const QVariantMap data = dataVar.toMap();
+        const QString status = data.value(QStringLiteral("status")).toString();
+        const QString apiMessage = data.value(QStringLiteral("message")).toString();
+        if (status.compare(QStringLiteral("error"), Qt::CaseInsensitive) == 0) {
+            ret.message = !apiMessage.isEmpty()
+                              ? apiMessage
+                              : QStringLiteral("should_use_slipstream: status=error");
+            return ret;
+        }
+        const QVariant v = data.value(QStringLiteral("should_use_slipstream"));
         if (!v.isValid() || v.type() != QVariant::Bool) {
             ret.message = QStringLiteral("should_use_slipstream: data.should_use_slipstream missing or not bool");
             return ret;
