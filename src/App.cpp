@@ -610,21 +610,10 @@ void App::parseArgs()
     },
     {
         "slipstream",
-        QString("Enable MARA Slipstream broadcast intercept for BTC. When enabled, blockchain.transaction.broadcast"
-                " asks the Nunchuk decision API whether to submit via Slipstream or bitcoind."
-                " Requires --slipstream-client-code and --slipstream-api-token (or the matching config/env vars).\n"),
-    },
-    {
-        "slipstream-url",
-        QString("Corresponds to the configuration file variable \"slipstream_url\". Base URL for the Slipstream API"
-                " (default: https://slipstream.mara.com).\n"),
-        QString("url"),
-    },
-    {
-        "slipstream-client-code",
-        QString("Corresponds to the configuration file variable \"slipstream_client_code\". Required when --slipstream"
-                " / slipstream is enabled. Do not commit this value to public configuration files.\n"),
-        QString("code"),
+        QString("Enable Slipstream broadcast intercept for BTC. When enabled, blockchain.transaction.broadcast asks"
+                " the Nunchuk decision API: if should_use_slipstream is true the decision API handles Slipstream"
+                " broadcast and Fulcrum returns the txid; if false Fulcrum uses bitcoind."
+                " Requires --slipstream-api-token (or the matching config/env var).\n"),
     },
     {
         "slipstream-api-token",
@@ -641,7 +630,7 @@ void App::parseArgs()
     {
         "slipstream-timeout",
         QString("Corresponds to the configuration file variable \"slipstream_timeout\". HTTP timeout in seconds for"
-                " Slipstream / decision API requests (default: %1).\n").arg(Options::defaultSlipstreamTimeoutSecs),
+                " decision API requests (default: %1).\n").arg(Options::defaultSlipstreamTimeoutSecs),
         QString("seconds"),
     },
     {
@@ -1660,8 +1649,6 @@ void App::parseArgs()
     }
 
     // CLI: --slipstream / conf: slipstream
-    // CLI: --slipstream-url / conf: slipstream_url
-    // CLI: --slipstream-client-code / conf: slipstream_client_code
     // CLI: --slipstream-api-token / conf: slipstream_api_token / env: SLIPSTREAM_API_TOKEN
     // CLI: --slipstream-decision-url / conf: slipstream_decision_url
     // CLI: --slipstream-timeout / conf: slipstream_timeout
@@ -1675,17 +1662,6 @@ void App::parseArgs()
             if (!ok)
                 throw BadArgs("slipstream: bad value. Specify a boolean value such as 0, 1, true, false, yes, no");
             options->slipstream = val;
-        }
-        if (const bool pset = parser.isSet("slipstream-url"); pset || conf.hasValue("slipstream_url")) {
-            const QString url = (pset ? parser.value("slipstream-url") : conf.value("slipstream_url")).trimmed();
-            if (url.isEmpty())
-                throw BadArgs("slipstream_url / --slipstream-url: may not be empty");
-            options->slipstreamUrl = url;
-        }
-        if (const bool pset = parser.isSet("slipstream-client-code"); pset || conf.hasValue("slipstream_client_code")) {
-            const QString code = (pset ? parser.value("slipstream-client-code")
-                                       : conf.value("slipstream_client_code")).trimmed();
-            options->slipstreamClientCode = code;
         }
         {
             const bool pset = parser.isSet("slipstream-api-token");
@@ -1715,17 +1691,14 @@ void App::parseArgs()
                                   .arg(name).arg(Options::slipstreamTimeoutSecsMin).arg(Options::slipstreamTimeoutSecsMax));
             options->slipstreamTimeoutSecs = secs;
         }
-        if (options->slipstream && options->slipstreamClientCode.isEmpty())
-            throw BadArgs("slipstream is enabled but slipstream_client_code / --slipstream-client-code is missing or empty");
         if (options->slipstream && options->slipstreamApiToken.isEmpty())
             throw BadArgs("slipstream is enabled but slipstream_api_token / --slipstream-api-token"
                           " / env SLIPSTREAM_API_TOKEN is missing or empty");
         if (options->slipstream) {
-            Util::AsyncOnObject(this, [url = options->slipstreamUrl,
-                                       decisionUrl = options->slipstreamDecisionUrl,
+            Util::AsyncOnObject(this, [decisionUrl = options->slipstreamDecisionUrl,
                                        to = options->slipstreamTimeoutSecs] {
-                Log() << "Slipstream broadcast intercept enabled; url=" << url
-                      << " decision_url=" << decisionUrl << " timeout=" << to << "s";
+                Log() << "Slipstream broadcast intercept enabled; decision_url=" << decisionUrl
+                      << " timeout=" << to << "s";
             });
         }
     }

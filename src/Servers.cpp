@@ -2192,10 +2192,9 @@ void Server::rpc_blockchain_transaction_broadcast(Client *c, const RPC::BatchId 
         struct SlipstreamWorkResult {
             bool useBitcoind = false;
             bool failed = false;
-            QString slipstreamTxid;
-            QString errorMessage; ///< set when failed; may be decision/slipstream/fee-rate error text
+            QString errorMessage; ///< set when failed; decision/fee-rate error text
             double feeRate = 0.;
-            QString txid;
+            QString txid; ///< Electrum-order hex; returned to client when decision API handled Slipstream
         };
         generic_do_async(
             c, batchId, m.id,
@@ -2203,8 +2202,6 @@ void Server::rpc_blockchain_transaction_broadcast(Client *c, const RPC::BatchId 
             [storage = this->storage, rawtxhex,
              decisionUrl = options->slipstreamDecisionUrl,
              apiToken = options->slipstreamApiToken,
-             url = options->slipstreamUrl,
-             clientCode = options->slipstreamClientCode,
              timeoutSecs = options->slipstreamTimeoutSecs] {
                 SlipstreamWorkResult out;
                 {
@@ -2225,19 +2222,9 @@ void Server::rpc_blockchain_transaction_broadcast(Client *c, const RPC::BatchId 
                     out.errorMessage = decision.message;
                     return out;
                 }
-                if (!decision.shouldUse) {
+                // true → decision API already broadcast via Slipstream; false → use bitcoind locally
+                if (!decision.shouldUse)
                     out.useBitcoind = true;
-                    return out;
-                }
-                const auto res = SlipstreamClient::submitTx(url, clientCode, rawtxhex, timeoutSecs);
-                if (!res.ok) {
-                    out.failed = true;
-                    out.errorMessage = QString("the transaction was rejected by network rules.\n\n"
-                                               "slipstream: %1\n")
-                                           .arg(res.message);
-                    return out;
-                }
-                out.slipstreamTxid = res.message;
                 return out;
             },
             // Completion — client thread
@@ -2260,18 +2247,19 @@ void Server::rpc_blockchain_transaction_broadcast(Client *c, const RPC::BatchId 
                     emit c->sendError(false, RPC::Code_App_BadRequest, res.errorMessage, batchId, reqId);
                     return;
                 }
+                // Decision API returned should_use_slipstream=true and performed the Slipstream submit.
                 const size_t size = size_t(rawtxhex.length() / 2);
                 ++c->info.nTxSent;
                 c->info.nTxBytesSent += size;
                 emit broadcastTxSuccess(1u, size);
-                QVariant ret = res.slipstreamTxid;
+                QVariant ret = res.txid;
                 QByteArray logLine;
                 {
                     QTextStream ts{&logLine, QIODevice::WriteOnly};
-                    ts << "Broadcast tx via Slipstream for client " << c->id;
+                    ts << "Broadcast tx via Slipstream (decision API) for client " << c->id;
                     if (!options->anonLogs)
                         ts << ", size: " << qulonglong(size) << " bytes, feeRate: " << res.feeRate
-                           << " sats/vByte, response: " << res.slipstreamTxid;
+                           << " sats/vByte, txid: " << res.txid;
                 }
                 logFilter->broadcast(true, logLine, txkey);
                 const QVariant warned = maybePhishingWarningResult(c, coin, ret);

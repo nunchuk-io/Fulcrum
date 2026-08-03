@@ -21,14 +21,9 @@
 #include <QByteArray>
 #include <QString>
 
-/// Synchronous HTTP helpers for MARA Slipstream + Nunchuk routing decision.
-/// Intended to be called from a worker thread (e.g. generic_do_async work lambda).
+/// Synchronous HTTP helper for the Nunchuk slipstream routing decision.
+/// Intended to be called from a worker thread (e.g. ThreadPool work lambda).
 namespace SlipstreamClient {
-
-struct SubmitResult {
-    bool ok = false;
-    QString message; ///< txid (or success text) on ok; error detail otherwise
-};
 
 /// Nunchuk decision API result.
 ///   POST <decisionUrl>
@@ -36,17 +31,15 @@ struct SubmitResult {
 ///   Content-Type: application/json
 ///   Body: { "tx_hex": "<hex>", "tx_id": "<hex>", "fee_rate": <positive decimal sat/vB> }
 ///   Response 200 JSON: { "data": { "should_use_slipstream": <bool> } }
+/// When should_use_slipstream is true, the decision API itself performs the Slipstream
+/// broadcast; Fulcrum only needs to echo the txid to the Electrum client.
 struct DecisionResult {
     bool ok = false;           ///< HTTP/parse succeeded
     bool shouldUse = false;    ///< meaningful only when ok==true
     QString message;           ///< error detail when !ok
 };
 
-/// POST {baseUrl}/api/transactions with JSON body {tx_hex, client_code}.
-SubmitResult submitTx(const QString &baseUrl, const QString &clientCode,
-                      const QByteArray &txHex, int timeoutSecs);
-
-/// Ask Nunchuk whether this broadcast should go via Slipstream.
+/// Ask Nunchuk whether this broadcast was (or should be) handled via Slipstream.
 DecisionResult shouldUseSlipstream(const QString &decisionUrl, const QString &apiToken,
                                    const QByteArray &txHex, const QString &txId,
                                    double feeRateSatsPerVByte, int timeoutSecs);
