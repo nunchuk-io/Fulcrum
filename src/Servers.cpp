@@ -2081,13 +2081,30 @@ namespace {
             const TXO txo{BTC::Hash2ByteArrayRev(in.prevout.GetTxId()), IONum(in.prevout.GetN())};
             std::optional<TXOInfo> info;
             try {
+                // Prefer the live unspent view (confirmed + mempool).
                 info = storage.utxoGet(txo);
+                // RBF / mempool-spend case: utxoGet hides confirmed UTXOs that are already spent by
+                // another mempool tx, even though they still exist on-chain and in the UTXO DB.
+                // Fee calculation only needs the amount, so fall back to the DB entry.
+                if (!info.has_value())
+                    info = storage.utxoGetFromDB(txo, false);
+                // Parent is a mempool tx whose output was already spent by yet another mempool tx:
+                // still take the output amount from the parent mempool entry.
+                if (!info.has_value()) {
+                    auto [mempool, lock] = storage.mempool();
+                    if (auto it = mempool.txs.find(txo.txHash); it != mempool.txs.end()) {
+                        const auto &mtx = it->second;
+                        if (mtx && txo.outN < mtx->txos.size() && mtx->txos[txo.outN].isValid())
+                            info = mtx->txos[txo.outN];
+                    }
+                }
             } catch (const std::exception &e) {
                 return fail(QStringLiteral("cannot determine transaction fee rate (utxo lookup error: %1)")
                                 .arg(QString::fromUtf8(e.what())));
             }
             if (!info.has_value())
-                return fail(QStringLiteral("cannot determine transaction fee rate (missing input UTXO)"));
+                return fail(QStringLiteral("cannot determine transaction fee rate (missing input UTXO %1)")
+                                .arg(txo.toString()));
             inputSum += info->amount;
         }
 
