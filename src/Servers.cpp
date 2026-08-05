@@ -2042,10 +2042,12 @@ namespace {
     struct TxFeeInfo {
         double feeRateSatsPerVByte = 0.;
         QString txid; ///< big-endian hex (JSON / Electrum order)
+        bool feeKnown = true; ///< false when an input UTXO could not be resolved (feeRate forced to 0)
     };
 
     /// Fee rate + txid for a raw tx hex, using confirmed+mempool UTXOs from Storage.
-    /// On failure, sets *errOut (if non-null) and returns nullopt.
+    /// On hard failure (bad hex / coinbase / etc.), sets *errOut (if non-null) and returns nullopt.
+    /// If any input UTXO is missing, still succeeds with feeRate=0 and feeKnown=false.
     std::optional<TxFeeInfo> computeTxFeeInfo(Storage &storage, const QByteArray &rawtxhex, QString *errOut)
     {
         const auto fail = [&](const QString &msg) -> std::optional<TxFeeInfo> {
@@ -2074,38 +2076,46 @@ namespace {
         if (vsize == 0)
             return fail(QStringLiteral("cannot determine transaction fee rate (zero vsize)"));
 
+        TxFeeInfo out;
+        out.txid = QString::fromLatin1(Util::ToHexFast(BTC::Hash2ByteArrayRev(tx.GetHash())));
+
         bitcoin::Amount inputSum = bitcoin::Amount::zero();
+        bool missingUtxo = false;
         for (const auto &in : tx.vin) {
             if (in.prevout.IsNull())
                 return fail(QStringLiteral("cannot determine transaction fee rate (null prevout)"));
             const TXO txo{BTC::Hash2ByteArrayRev(in.prevout.GetTxId()), IONum(in.prevout.GetN())};
             std::optional<TXOInfo> info;
             try {
-                // Prefer the live unspent view (confirmed + mempool).
-                info = storage.utxoGet(txo);
-                // RBF / mempool-spend case: utxoGet hides confirmed UTXOs that are already spent by
-                // another mempool tx, even though they still exist on-chain and in the UTXO DB.
-                // Fee calculation only needs the amount, so fall back to the DB entry.
-                if (!info.has_value())
-                    info = storage.utxoGetFromDB(txo, false);
-                // Parent is a mempool tx whose output was already spent by yet another mempool tx:
-                // still take the output amount from the parent mempool entry.
+                // Fee calc only needs the input amount — including UTXOs already spent in mempool (RBF).
+                // Do not use utxoGet(): it does the same DB/mempool lookups then filters spent coins out.
+                // Confirmed inputs are the common case; mempool parents (CPFP / unconfirmed) are rarer.
+                info = storage.utxoGetFromDB(txo, false);
                 if (!info.has_value()) {
                     auto [mempool, lock] = storage.mempool();
                     if (auto it = mempool.txs.find(txo.txHash); it != mempool.txs.end()) {
-                        const auto &mtx = it->second;
-                        if (mtx && txo.outN < mtx->txos.size() && mtx->txos[txo.outN].isValid())
-                            info = mtx->txos[txo.outN];
+                        const auto &mtxRef = it->second;
+                        if (mtxRef && txo.outN < mtxRef->txos.size() && mtxRef->txos[txo.outN].isValid())
+                            info = mtxRef->txos[txo.outN];
                     }
                 }
             } catch (const std::exception &e) {
-                return fail(QStringLiteral("cannot determine transaction fee rate (utxo lookup error: %1)")
-                                .arg(QString::fromUtf8(e.what())));
+                DebugM("Slipstream fee: utxo lookup error for ", txo.toString(), ": ", e.what());
+                missingUtxo = true;
+                break;
             }
-            if (!info.has_value())
-                return fail(QStringLiteral("cannot determine transaction fee rate (missing input UTXO %1)")
-                                .arg(txo.toString()));
+            if (!info.has_value()) {
+                DebugM("Slipstream fee: missing input UTXO ", txo.toString(), "; fee_rate=0");
+                missingUtxo = true;
+                break;
+            }
             inputSum += info->amount;
+        }
+
+        if (missingUtxo) {
+            out.feeRateSatsPerVByte = 0.;
+            out.feeKnown = false;
+            return out;
         }
 
         const bitcoin::Amount fee = inputSum - tx.GetValueOut();
@@ -2113,9 +2123,8 @@ namespace {
         if (feeSats < 0)
             return fail(QStringLiteral("cannot determine transaction fee rate (negative fee)"));
 
-        TxFeeInfo out;
         out.feeRateSatsPerVByte = double(feeSats) / double(vsize);
-        out.txid = QString::fromLatin1(Util::ToHexFast(BTC::Hash2ByteArrayRev(tx.GetHash())));
+        out.feeKnown = true;
         return out;
     }
 
@@ -2209,6 +2218,7 @@ void Server::rpc_blockchain_transaction_broadcast(Client *c, const RPC::BatchId 
         struct SlipstreamWorkResult {
             bool useBitcoind = false;
             bool failed = false;
+            bool feeKnown = true; ///< false ⇒ fee_rate sent as 0; bitcoind fallback forbidden
             QString errorMessage; ///< set when failed; decision/fee-rate error text
             double feeRate = 0.;
             QString txid; ///< Electrum-order hex; returned to client when decision API handled Slipstream
@@ -2231,6 +2241,10 @@ void Server::rpc_blockchain_transaction_broadcast(Client *c, const RPC::BatchId 
                     }
                     out.feeRate = feeOpt->feeRateSatsPerVByte;
                     out.txid = feeOpt->txid;
+                    out.feeKnown = feeOpt->feeKnown;
+                    if (!out.feeKnown)
+                        Log() << "Slipstream fee unknown for txid " << out.txid
+                              << " (missing input UTXO); sending fee_rate=0; bitcoind fallback disabled";
                 }
                 const auto decision = SlipstreamClient::shouldUseSlipstream(
                     decisionUrl, apiToken, rawtxhex, out.txid, out.feeRate, timeoutSecs);
@@ -2243,12 +2257,22 @@ void Server::rpc_blockchain_transaction_broadcast(Client *c, const RPC::BatchId 
                 }
                 Log() << "Slipstream decision API ok for txid " << out.txid
                       << " feeRate=" << out.feeRate << " sats/vByte"
+                      << " feeKnown=" << (out.feeKnown ? "true" : "false")
                       << " should_use_slipstream=" << (decision.shouldUse ? "true" : "false")
                       << (decision.shouldUse ? "; Slipstream handled by decision API"
-                                             : "; using bitcoind");
-                // true → decision API already broadcast via Slipstream; false → use bitcoind locally
-                if (!decision.shouldUse)
-                    out.useBitcoind = true;
+                                             : (out.feeKnown ? "; using bitcoind"
+                                                              : "; bitcoind forbidden (fee unknown)"));
+                if (decision.shouldUse)
+                    return out; // success path: decision API already broadcast
+                // should_use_slipstream=false
+                if (!out.feeKnown) {
+                    out.failed = true;
+                    out.errorMessage = QStringLiteral(
+                        "cannot broadcast: fee rate unknown (missing input UTXO) and "
+                        "decision API declined Slipstream (should_use_slipstream=false)");
+                    return out;
+                }
+                out.useBitcoind = true;
                 return out;
             },
             // Completion — client thread

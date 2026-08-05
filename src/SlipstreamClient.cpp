@@ -117,8 +117,8 @@ DecisionResult shouldUseSlipstream(const QString &decisionUrl, const QString &ap
         ret.message = QStringLiteral("slipstream API token is empty");
         return ret;
     }
-    if (!(feeRateSatsPerVByte > 0.0)) {
-        ret.message = QStringLiteral("fee_rate must be a positive decimal sat/vB");
+    if (feeRateSatsPerVByte < 0.0) {
+        ret.message = QStringLiteral("fee_rate must be a non-negative decimal sat/vB");
         return ret;
     }
 

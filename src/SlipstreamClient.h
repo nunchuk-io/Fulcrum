@@ -29,7 +29,7 @@ namespace SlipstreamClient {
 ///   POST <decisionUrl>
 ///   Authorization: Bearer <apiToken>
 ///   Content-Type: application/json
-///   Body: { "tx_hex": "<hex>", "tx_id": "<hex>", "fee_rate": <positive decimal sat/vB> }
+///   Body: { "tx_hex": "<hex>", "tx_id": "<hex>", "fee_rate": <non-negative decimal sat/vB> }
 ///   Response 200 JSON:
 ///     { "data": { "status": "<string>", "message": "<string>",
 ///                 "should_use_slipstream": <bool> } }
